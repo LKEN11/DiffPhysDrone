@@ -6,6 +6,55 @@ import torch.nn.functional as F
 import quadsim_cuda
 
 
+class DepthEventCamera:
+    """Converts sequential depth maps into event frames.
+
+    The camera models log-intensity changes derived from inverse depth and
+    triggers events once the accumulated change passes a configurable threshold.
+    Positive events are produced when the scene becomes closer (inverse depth
+    increases), while negative events correspond to receding content.
+    """
+
+    def __init__(self, pos_threshold=0.2, neg_threshold=0.2, min_depth=0.05, log_eps=1e-3):
+        self.pos_threshold = pos_threshold
+        self.neg_threshold = neg_threshold
+        self.min_depth = min_depth
+        self.log_eps = log_eps
+        self.prev_log_depth = None
+
+    def reset(self, batch_size, height, width, device):
+        self.prev_log_depth = None
+
+    @torch.no_grad()
+    def __call__(self, depth: torch.Tensor, timestamp: float):
+        # Convert depth to a log-like brightness surrogate using inverse depth.
+        log_depth = torch.log1p(1.0 / depth.clamp_min(self.min_depth) + self.log_eps)
+
+        if self.prev_log_depth is None:
+            self.prev_log_depth = log_depth
+            return torch.zeros(
+                (depth.shape[0], 2, depth.shape[1], depth.shape[2]),
+                device=depth.device,
+                dtype=torch.int32,
+            )
+
+        delta = log_depth - self.prev_log_depth
+        pos_count = torch.floor(delta / self.pos_threshold).clamp_min(0).to(torch.int32)
+        neg_count = torch.floor(-delta / self.neg_threshold).clamp_min(0).to(torch.int32)
+
+        events = torch.zeros(
+            (depth.shape[0], 2, depth.shape[1], depth.shape[2]),
+            device=depth.device,
+            dtype=torch.int32,
+        )
+        events[:, 0] = pos_count
+        events[:, 1] = neg_count
+
+        # Update the residual log depth so that the remaining difference stays below threshold.
+        self.prev_log_depth = self.prev_log_depth + pos_count.float() * self.pos_threshold - neg_count.float() * self.neg_threshold
+        return events
+
+
 class GDecay(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, alpha):
@@ -43,7 +92,8 @@ run = RunFunction.apply
 class Env:
     def __init__(self, batch_size, width, height, grad_decay, device='cpu', fov_x_half_tan=0.53,
                  single=False, gate=False, ground_voxels=False, scaffold=False, speed_mtp=1,
-                 random_rotation=False, cam_angle=10) -> None:
+                 random_rotation=False, cam_angle=10, use_event_camera=False,
+                 event_pos_threshold=0.2, event_neg_threshold=0.2) -> None:
         self.device = device
         self.batch_size = batch_size
         self.width = width
@@ -94,12 +144,20 @@ class Env:
         self.random_rotation = random_rotation
         self.cam_angle = cam_angle
         self.fov_x_half_tan = fov_x_half_tan
+        self.use_event_camera = use_event_camera
+        self.event_camera = None
+        if self.use_event_camera:
+            self.event_camera = DepthEventCamera(
+                pos_threshold=event_pos_threshold,
+                neg_threshold=event_neg_threshold,
+            )
         self.reset()
         # self.obj_avoid_grad_mtp = torch.tensor([0.5, 2., 1.], device=device)
 
     def reset(self):
         B = self.batch_size
         device = self.device
+        self.t = 0.0
 
         cam_angle = (self.cam_angle + torch.randn(B, device=device)) * math.pi / 180
         zeros = torch.zeros_like(cam_angle)
@@ -254,6 +312,9 @@ class Env:
         self.drag_2[:, 0] = 0
         self.z_drag_coef = torch.ones((B, 1), device=device)
 
+        if self.event_camera is not None:
+            self.event_camera.reset(self.batch_size, self.height, self.width, self.device)
+
     @staticmethod
     @torch.no_grad()
     def update_state_vec(R, a_thr, v_pred, alpha, yaw_inertia=5):
@@ -285,7 +346,10 @@ class Env:
                             self.voxels, self.R @ self.R_cam, self.R_old, self.p,
                             self.p_old, self.drone_radius, self.n_drones_per_group,
                             self._fov_x_half_tan)
-        return canvas, None
+        events = None
+        if self.event_camera is not None:
+            events = self.event_camera(canvas, self.t)
+        return canvas, events
 
     def find_vec_to_nearest_pt(self):
         p = self.p + self.v * self.sub_div
@@ -304,6 +368,8 @@ class Env:
         alpha = torch.exp(-self.yaw_ctl_delay * ctl_dt)
         self.R_old = self.R.clone()
         self.R = quadsim_cuda.update_state_vec(self.R, self.act, v_pred, alpha, 5)
+        if self.use_event_camera:
+            self.t += ctl_dt
 
     def _run(self, act_pred, ctl_dt=1/15, v_pred=None):
         alpha = torch.exp(-self.pitch_ctl_delay * ctl_dt)
